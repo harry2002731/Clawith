@@ -1339,6 +1339,9 @@ function AgentDetailInner() {
     const validTabs = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'approvals', 'settings'];
     const hashTab = location.hash?.replace('#', '');
     const [activeTab, setActiveTabRaw] = useState<string>(hashTab && validTabs.includes(hashTab) ? hashTab : 'status');
+    const isLiveOverviewTab = activeTab === 'status' || activeTab === 'chat' || activeTab === 'activityLog';
+    const agentRefreshMs = activeTab === 'chat' ? 3000 : isLiveOverviewTab ? 5000 : 15000;
+    const activityRefreshMs = activeTab === 'activityLog' ? 5000 : activeTab === 'status' ? 10000 : false;
 
     // Sync URL hash when tab changes
     const setActiveTab = (tab: string) => {
@@ -1350,6 +1353,8 @@ function AgentDetailInner() {
         queryKey: ['agent', id],
         queryFn: () => agentApi.get(id!),
         enabled: !!id,
+        refetchInterval: !!id ? agentRefreshMs : false,
+        refetchOnWindowFocus: true,
     });
 
     // ── Aware tab data: triggers ──
@@ -1435,7 +1440,8 @@ function AgentDetailInner() {
         queryKey: ['activity', id],
         queryFn: () => activityApi.list(id!, 100),
         enabled: !!id && (activeTab === 'activityLog' || activeTab === 'status'),
-        refetchInterval: activeTab === 'activityLog' ? 10000 : false,
+        refetchInterval: !!id && (activeTab === 'activityLog' || activeTab === 'status') ? activityRefreshMs : false,
+        refetchOnWindowFocus: true,
     });
 
     // Chat history
@@ -1957,6 +1963,28 @@ function AgentDetailInner() {
             if (data && data.length > 0) selectSession(data[0], 'mine');
         });
     }, [id, token, activeTab, currentUser?.id]);
+
+    useEffect(() => {
+        if (!id || !token || activeTab !== 'chat') return;
+
+        let cancelled = false;
+        const run = async () => {
+            if (document.visibilityState !== 'visible') return;
+            await fetchMySessions(true, id);
+            if (canViewAllAgentChatSessions && chatScope === 'all') {
+                await fetchAllSessions();
+            }
+            if (!cancelled && activeSession && !isWritableSession(activeSession, chatScope)) {
+                await selectSession(activeSession, chatScope);
+            }
+        };
+
+        const timer = window.setInterval(run, 8000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+        };
+    }, [id, token, activeTab, chatScope, canViewAllAgentChatSessions, activeSession?.id]);
 
     const ensureSessionSocket = (sess: any, agentId: string, authToken: string) => {
         const sessionId = String(sess.id);
@@ -2624,6 +2652,8 @@ function AgentDetailInner() {
         queryFn: () => agentApi.metrics(id!).catch(() => null),
         enabled: !!id && activeTab === 'status',
         retry: false,
+        refetchInterval: activeTab === 'status' ? 10000 : false,
+        refetchOnWindowFocus: true,
     });
 
     const { data: channelConfig } = useQuery({
@@ -2735,16 +2765,37 @@ function AgentDetailInner() {
 
     // Compute display status (including OpenClaw disconnected detection)
     const computeStatusKey = () => {
-        if (agent.status === 'error') return 'error';
         if (agent.status === 'creating') return 'creating';
         if (agent.status === 'stopped') return 'stopped';
+        if (agent.status === 'error') return 'error';
         if ((agent as any).agent_type === 'openclaw' && agent.status === 'running' && (agent as any).openclaw_last_seen) {
             const elapsed = Date.now() - new Date((agent as any).openclaw_last_seen).getTime();
             if (elapsed > 60 * 60 * 1000) return 'disconnected';
         }
-        return agent.status === 'running' ? 'running' : 'idle';
+        return 'available';
     };
     const statusKey = computeStatusKey();
+    const runtimeState = (agent as any).runtime_state || ((agent as any).is_online ? 'waiting' : 'offline');
+    const runtimeLabel = (() => {
+        switch (runtimeState) {
+            case 'tool_running': return '执行工具中';
+            case 'responding': return '回复中';
+            case 'thinking': return '思考中';
+            case 'waiting': return '在线待命';
+            case 'offline': return '未连接';
+            default: return (agent as any).is_online ? '在线待命' : '未连接';
+        }
+    })();
+    const runtimeColor = (() => {
+        switch (runtimeState) {
+            case 'tool_running': return 'var(--warning)';
+            case 'responding': return 'var(--status-running)';
+            case 'thinking': return '#3b82f6';
+            case 'waiting': return 'var(--status-idle)';
+            case 'offline': return 'var(--text-tertiary)';
+            default: return (agent as any).is_online ? 'var(--status-running)' : 'var(--text-tertiary)';
+        }
+    })();
     const canManage = (agent as any).access_level === 'manage' || isAdmin;
 
     return (
@@ -2795,6 +2846,20 @@ function AgentDetailInner() {
                             <p className="page-subtitle" style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
                                 <span className={`status-dot ${statusKey}`} />
                                 {t(`agent.status.${statusKey}`)}
+                                {statusKey === 'available' && (
+                                    <span style={{
+                                        display: 'inline-flex', alignItems: 'center', gap: '6px',
+                                        marginLeft: '8px', padding: '2px 8px', borderRadius: '999px',
+                                        background: 'var(--bg-secondary)', color: runtimeColor,
+                                        fontSize: '11px', border: '1px solid var(--border-subtle)',
+                                    }}>
+                                        <span style={{
+                                            width: '6px', height: '6px', borderRadius: '50%',
+                                            background: runtimeColor, display: 'inline-block',
+                                        }} />
+                                        {runtimeLabel}
+                                    </span>
+                                )}
                                 {canManage && editingRole ? (
                                     <textarea
                                         autoFocus
@@ -2859,7 +2924,7 @@ function AgentDetailInner() {
                     </div>
                     <div style={{ display: 'flex', gap: '8px' }}>
                         <button className="btn btn-primary" onClick={() => setActiveTab('chat')}>{t('agent.actions.chat')}</button>
-                        {(agent as any)?.agent_type !== 'openclaw' && (
+                        {(agent as any)?.agent_type === 'openclaw' && (
                             <>
                                 {agent.status === 'stopped' ? (
                                     <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
@@ -2911,6 +2976,12 @@ function AgentDetailInner() {
                                         <span className={`status-dot ${statusKey}`} />
                                         <span style={{ fontSize: '16px', fontWeight: 500 }}>{t(`agent.status.${statusKey}`)}</span>
                                     </div>
+                                    {statusKey === 'available' && (
+                                        <div style={{ fontSize: '12px', color: runtimeColor, marginTop: '8px' }}>
+                                            {runtimeLabel}
+                                            {(agent as any).runtime_detail ? ` · ${(agent as any).runtime_detail}` : ''}
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="card">
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>🗓️ {t('agent.settings.today')} Token</div>
@@ -2992,6 +3063,13 @@ function AgentDetailInner() {
                                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
                                             <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.profile.lastActive')}</span>
                                             <span>{agent.last_active_at ? formatDate(agent.last_active_at) : '—'}</span>
+                                        </div>
+                                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', gap: '12px' }}>
+                                            <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>Runtime</span>
+                                            <span style={{ textAlign: 'right', color: runtimeColor }}>
+                                                {runtimeLabel}
+                                                {(agent as any).active_session_count ? ` · ${(agent as any).active_session_count} session` : ''}
+                                            </span>
                                         </div>
                                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
                                             <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.profile.timezone')}</span>

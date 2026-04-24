@@ -70,7 +70,8 @@ class EnterpriseInfo(Base):
     __tablename__ = "enterprise_info"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    info_type: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)  # org_structure, company_profile, etc.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), index=True)
+    info_type: Mapped[str] = mapped_column(String(50), nullable=False)  # org_structure, company_profile, etc.
     content: Mapped[dict] = mapped_column(JSON, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     visible_roles: Mapped[list] = mapped_column(JSON, default=[])  # Which agent roles can see this

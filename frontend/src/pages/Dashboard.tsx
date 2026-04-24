@@ -77,8 +77,7 @@ const priorityColor = (p: string) => {
 
 const statusLabel = (s: string, t: any) => {
     switch (s) {
-        case 'running': return t('dashboard.status.running');
-        case 'idle': return t('dashboard.status.idle');
+        case 'available': return t('dashboard.status.available');
         case 'stopped': return t('dashboard.status.stopped');
         case 'error': return t('dashboard.status.error');
         case 'creating': return t('dashboard.status.creating');
@@ -89,11 +88,43 @@ const statusLabel = (s: string, t: any) => {
 
 const statusColor = (s: string) => {
     switch (s) {
-        case 'running': return 'var(--status-running)';
-        case 'idle': return 'var(--status-idle)';
+        case 'available': return 'var(--status-running)';
         case 'error': return 'var(--status-error)';
         case 'stopped': return 'var(--status-stopped)';
         default: return 'var(--text-tertiary)';
+    }
+};
+
+const displayStatus = (agent: Agent): string => {
+    if (agent.status === 'creating') return 'creating';
+    if (agent.status === 'stopped') return 'stopped';
+    if (agent.status === 'error') return 'error';
+    if (agent.agent_type === 'openclaw' && agent.status === 'running' && agent.openclaw_last_seen) {
+        const elapsed = Date.now() - new Date(agent.openclaw_last_seen).getTime();
+        if (elapsed > 60 * 60 * 1000) return 'disconnected';
+    }
+    return 'available';
+};
+
+const runtimeLabel = (agent: Agent) => {
+    switch (agent.runtime_state) {
+        case 'tool_running': return '执行工具中';
+        case 'responding': return '回复中';
+        case 'thinking': return '思考中';
+        case 'waiting': return '在线待命';
+        case 'offline': return '未连接';
+        default: return agent.is_online ? '在线待命' : '未连接';
+    }
+};
+
+const runtimeColor = (agent: Agent) => {
+    switch (agent.runtime_state) {
+        case 'tool_running': return 'var(--warning)';
+        case 'responding': return 'var(--status-running)';
+        case 'thinking': return '#3b82f6';
+        case 'waiting': return 'var(--status-idle)';
+        case 'offline': return 'var(--text-tertiary)';
+        default: return agent.is_online ? 'var(--status-running)' : 'var(--text-tertiary)';
     }
 };
 
@@ -109,7 +140,7 @@ const formatTokens = (n: number) => {
 function StatsBar({ agents, allTasks }: { agents: Agent[]; allTasks: Task[] }) {
     const { t } = useTranslation();
     const totalAgents = agents.length;
-    const activeAgents = agents.filter(a => a.status === 'running' || a.status === 'idle').length;
+    const activeAgents = agents.filter(a => displayStatus(a) === 'available').length;
     const pendingTasks = allTasks.filter(t => t.status === 'pending' || t.status === 'doing').length;
     const completedToday = allTasks.filter(t => {
         if (t.status !== 'done' || !t.completed_at) return false;
@@ -213,10 +244,10 @@ function AgentRow({ agent, tasks, recentActivity }: {
                         }}>
                             <span style={{
                                 width: '6px', height: '6px', borderRadius: '50%',
-                                background: statusColor(agent.status),
+                                background: statusColor(displayStatus(agent)),
                                 display: 'inline-block',
                             }} />
-                            {statusLabel(agent.status, t)}
+                            {statusLabel(displayStatus(agent), t)}
                         </span>
                     </div>
                     <div style={{
@@ -224,6 +255,13 @@ function AgentRow({ agent, tasks, recentActivity }: {
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                     }}>
                         {agent.role_description || '-'}
+                    </div>
+                    <div style={{
+                        fontSize: '11px', marginTop: '4px', color: runtimeColor(agent),
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>
+                        {displayStatus(agent) === 'available' ? runtimeLabel(agent) : ''}
+                        {displayStatus(agent) === 'available' && agent.runtime_detail ? ` · ${agent.runtime_detail}` : ''}
                     </div>
                 </div>
             </div>

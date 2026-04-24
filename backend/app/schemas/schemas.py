@@ -270,6 +270,11 @@ class AgentOut(BaseModel):
     api_key_hash: str | None = None
     created_at: datetime
     last_active_at: datetime | None = None
+    is_online: bool = False
+    runtime_state: str = "offline"
+    runtime_detail: str | None = None
+    runtime_updated_at: datetime | None = None
+    active_session_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -473,6 +478,7 @@ class EnterpriseInfoUpdate(BaseModel):
 
 class EnterpriseInfoOut(BaseModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID | None = None
     info_type: str
     content: dict
     version: int

@@ -4,11 +4,13 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.agent import Agent
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
 
@@ -118,6 +120,42 @@ def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -
     return result
 
 
+def _require_tool_admin(current_user: User) -> None:
+    """Only org admins and platform admins can manage tenant/global tool config."""
+    if current_user.role not in ("platform_admin", "org_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+def _resolve_scoped_tenant_id(current_user: User, tenant_id: str | None) -> uuid.UUID | None:
+    """Resolve the effective tenant scope for a request.
+
+    Non-platform-admin users are always restricted to their own tenant.
+    """
+    if tenant_id:
+        try:
+            requested = uuid.UUID(tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid tenant_id format") from exc
+        if current_user.role != "platform_admin" and requested != current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="Cannot access other tenant's tools")
+        return requested
+    return current_user.tenant_id
+
+
+def _ensure_tool_belongs_to_user_scope(current_user: User, tool: Tool) -> None:
+    """Allow access to global builtin tools and tenant-local tools only."""
+    if current_user.role == "platform_admin":
+        return
+    if tool.tenant_id is not None and tool.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other tenant's tools")
+
+
+def _ensure_tool_belongs_to_agent_scope(tool: Tool, agent: Agent) -> None:
+    """Allow assigning global builtin tools or tools from the agent's tenant."""
+    if tool.tenant_id is not None and tool.tenant_id != agent.tenant_id:
+        raise HTTPException(status_code=403, detail="Tool does not belong to this agent's tenant")
+
+
 # ─── Schemas ────────────────────────────────────────────────
 class ToolCreate(BaseModel):
     name: str
@@ -165,16 +203,15 @@ async def list_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
+    tid = _resolve_scoped_tenant_id(current_user, tenant_id)
     query = (
         select(Tool)
         .where(Tool.source.in_(["builtin", "admin"]))
         .order_by(Tool.category, Tool.name)
     )
     # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific tools
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     if tid:
-        from sqlalchemy import or_ as _or
-        query = query.where(_or(Tool.tenant_id == None, Tool.tenant_id == uuid.UUID(tid)))
+        query = query.where(or_(Tool.tenant_id.is_(None), Tool.tenant_id == tid))
     result = await db.execute(query)
     tools = result.scalars().all()
     return [
@@ -213,16 +250,8 @@ async def create_tool(
     own tenant but can be overridden via data.tenant_id. This allows platform
     admins to import MCP tools while viewing another company's settings page.
     """
-    # Resolve target tenant: explicit payload value takes priority so that
-    # platform admins importing tools for another company work correctly.
-    target_tenant_id: uuid.UUID | None = None
-    if data.tenant_id:
-        try:
-            target_tenant_id = uuid.UUID(data.tenant_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid tenant_id format")
-    else:
-        target_tenant_id = current_user.tenant_id
+    _require_tool_admin(current_user)
+    target_tenant_id = _resolve_scoped_tenant_id(current_user, data.tenant_id)
 
     # Unique name check is scoped per tenant to avoid cross-tenant collisions.
     existing = await db.execute(
@@ -267,12 +296,14 @@ async def update_tools_bulk(
     db: AsyncSession = Depends(get_db),
 ):
     """Bulk update the enabled status of multiple tools."""
+    _require_tool_admin(current_user)
     tool_ids = [uuid.UUID(u.tool_id) for u in updates]
     result = await db.execute(select(Tool).where(Tool.id.in_(tool_ids)))
     tools_map = {str(t.id): t for t in result.scalars().all()}
     
     for update in updates:
         if update.tool_id in tools_map:
+            _ensure_tool_belongs_to_user_scope(current_user, tools_map[update.tool_id])
             tools_map[update.tool_id].enabled = update.enabled
             
     await db.commit()
@@ -287,10 +318,12 @@ async def update_tool(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a tool."""
+    _require_tool_admin(current_user)
     result = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = result.scalar_one_or_none()
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
+    _ensure_tool_belongs_to_user_scope(current_user, tool)
 
     update_data = data.model_dump(exclude_unset=True)
     # Encrypt sensitive fields in config
@@ -310,10 +343,12 @@ async def delete_tool(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a tool (only non-builtin)."""
+    _require_tool_admin(current_user)
     result = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = result.scalar_one_or_none()
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
+    _ensure_tool_belongs_to_user_scope(current_user, tool)
     if tool.type == "builtin":
         raise HTTPException(status_code=400, detail="Cannot delete builtin tools")
 
@@ -332,10 +367,18 @@ async def get_agent_tools(
 ):
     """Get tools for a specific agent with their enabled status."""
     from app.services.agent_tools import _agent_has_feishu
+    agent, _ = await check_agent_access(db, current_user, agent_id)
     has_feishu = await _agent_has_feishu(agent_id)
 
     # All available tools
-    all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
+    all_tools_r = await db.execute(
+        select(Tool)
+        .where(
+            Tool.enabled == True,
+            or_(Tool.tenant_id.is_(None), Tool.tenant_id == agent.tenant_id),
+        )
+        .order_by(Tool.category, Tool.name)
+    )
     all_tools = all_tools_r.scalars().all()
 
     # Agent-specific assignments
@@ -378,8 +421,16 @@ async def update_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Update tool assignments for an agent."""
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage" and current_user.role not in ("platform_admin", "org_admin"):
+        raise HTTPException(status_code=403, detail="Manage access required to update agent tools")
     for u in updates:
         tool_id = uuid.UUID(u.tool_id)
+        tool_result = await db.execute(select(Tool).where(Tool.id == tool_id))
+        tool = tool_result.scalar_one_or_none()
+        if not tool:
+            raise HTTPException(status_code=404, detail=f"Tool not found: {u.tool_id}")
+        _ensure_tool_belongs_to_agent_scope(tool, agent)
         # Upsert
         result = await db.execute(
             select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)
@@ -449,15 +500,8 @@ async def update_mcp_server(
     2. URL query param (e.g. ?tavilyApiKey=xxx) — extracted from the URL
        and converted to Bearer by MCPClient automatically.
     """
-    # Resolve target tenant
-    target_tenant_id: uuid.UUID | None = None
-    if data.tenant_id:
-        try:
-            target_tenant_id = uuid.UUID(data.tenant_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid tenant_id format")
-    else:
-        target_tenant_id = current_user.tenant_id
+    _require_tool_admin(current_user)
+    target_tenant_id = _resolve_scoped_tenant_id(current_user, data.tenant_id)
 
     # Load all tools from this server under the target tenant
     result = await db.execute(
@@ -497,7 +541,9 @@ async def list_agent_installed_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Admin endpoint: list user-installed tools scoped by tenant."""
+    _require_tool_admin(current_user)
     from app.models.agent import Agent
+    tid = _resolve_scoped_tenant_id(current_user, tenant_id)
     query = (
         select(AgentTool, Tool, Agent)
         .join(Tool, AgentTool.tool_id == Tool.id)
@@ -506,7 +552,6 @@ async def list_agent_installed_tools(
         .order_by(AgentTool.created_at.desc())
     )
     # Scope by tenant: only show tools installed by agents in this tenant
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     if tid:
         from app.models.agent import Agent as Ag
         tenant_agent_ids = select(Ag.id).where(Ag.tenant_id == tid)
@@ -537,10 +582,17 @@ async def delete_agent_tool(
     db: AsyncSession = Depends(get_db),
 ):
     """Admin: remove an agent-tool assignment. Also deletes the tool record if no other agents use it."""
+    _require_tool_admin(current_user)
     at_r = await db.execute(select(AgentTool).where(AgentTool.id == agent_tool_id))
     at = at_r.scalar_one_or_none()
     if not at:
         raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    agent_r = await db.execute(select(Agent).where(Agent.id == at.agent_id))
+    agent = agent_r.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if current_user.role != "platform_admin" and agent.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot delete other tenant's agent tools")
     tool_id = at.tool_id
     await db.delete(at)
     await db.flush()
@@ -573,10 +625,12 @@ async def get_agent_tool_config(
     Both configs are decrypted before returning. Global sensitive fields are
     masked so the frontend can show a key is configured without exposing it.
     """
+    agent, _ = await check_agent_access(db, current_user, agent_id)
     tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = tool_r.scalar_one_or_none()
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
+    _ensure_tool_belongs_to_agent_scope(tool, agent)
     at_r = await db.execute(
         select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)
     )
@@ -617,6 +671,9 @@ async def update_agent_tool_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Save per-agent config override for a tool."""
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage" and current_user.role not in ("platform_admin", "org_admin"):
+        raise HTTPException(status_code=403, detail="Manage access required to update tool config")
     # Check permission: only platform_admin and org_admin can modify allow_network
     if "allow_network" in data.config:
         if current_user.role not in ("platform_admin", "org_admin"):
@@ -628,6 +685,9 @@ async def update_agent_tool_config(
     # Encrypt sensitive fields using the tool's config_schema for field type awareness
     tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool_for_schema = tool_r2.scalar_one_or_none()
+    if not tool_for_schema:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    _ensure_tool_belongs_to_agent_scope(tool_for_schema, agent)
     encrypted_config = _encrypt_sensitive_fields(data.config, tool_for_schema.config_schema if tool_for_schema else None)
 
     at_r = await db.execute(
@@ -660,9 +720,17 @@ async def get_agent_tools_with_config(
     the agent-level UI can show the inherited key hint.
     """
     from app.services.agent_tools import _agent_has_feishu
+    agent, _ = await check_agent_access(db, current_user, agent_id)
     has_feishu = await _agent_has_feishu(agent_id)
 
-    all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
+    all_tools_r = await db.execute(
+        select(Tool)
+        .where(
+            Tool.enabled == True,
+            or_(Tool.tenant_id.is_(None), Tool.tenant_id == agent.tenant_id),
+        )
+        .order_by(Tool.category, Tool.name)
+    )
     all_tools = all_tools_r.scalars().all()
     agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
     assignments = {str(at.tool_id): at for at in agent_tools_r.scalars().all()}
@@ -694,7 +762,7 @@ async def get_agent_tools_with_config(
 
         # Fallback: resolve api_key from system_settings for tools that store
         # their key there (e.g. Jina). Only if Tool.config doesn't have it.
-        if t.name in SYSTEM_SETTINGS_TOOL_MAP and not raw_global.get("api_key"):
+        if current_user.role == "platform_admin" and t.name in SYSTEM_SETTINGS_TOOL_MAP and not raw_global.get("api_key"):
             ss_key, ss_field = SYSTEM_SETTINGS_TOOL_MAP[t.name]
             if ss_key not in system_keys_cache:
                 try:

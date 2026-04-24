@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from loguru import logger
@@ -27,6 +28,7 @@ class ConnectionManager:
     def __init__(self):
         # agent_id_str -> list of (WebSocket, session_id_str | None)
         self.active_connections: dict[str, list[tuple]] = {}
+        self.runtime_state: dict[str, dict] = {}
 
     async def connect(self, agent_id: str, websocket: WebSocket, session_id: str = None):
         await websocket.accept()
@@ -39,6 +41,9 @@ class ConnectionManager:
             self.active_connections[agent_id] = [
                 (ws, sid) for ws, sid in self.active_connections[agent_id] if ws != websocket
             ]
+            if not self.active_connections[agent_id]:
+                self.active_connections.pop(agent_id, None)
+                self.mark_state(agent_id, "offline", "No active web session")
 
     async def send_message(self, agent_id: str, message: dict):
         if agent_id in self.active_connections:
@@ -64,8 +69,52 @@ class ConnectionManager:
             return []
         return list(set(sid for _ws, sid in self.active_connections[agent_id] if sid))
 
+    def mark_state(self, agent_id: str, state: str, detail: str | None = None, session_id: str | None = None):
+        """Track the current runtime state for an agent."""
+        self.runtime_state[agent_id] = {
+            "state": state,
+            "detail": detail,
+            "session_id": session_id,
+            "updated_at": datetime.now(timezone.utc),
+            "active_session_count": len(self.active_connections.get(agent_id, [])),
+        }
+
+    def get_runtime(self, agent_id: str) -> dict:
+        """Return a runtime snapshot for UI consumption."""
+        active_session_count = len(self.active_connections.get(agent_id, []))
+        current = dict(self.runtime_state.get(agent_id, {}))
+
+        if not current:
+            return {
+                "state": "waiting" if active_session_count > 0 else "offline",
+                "detail": "Connected, waiting for input" if active_session_count > 0 else "No active web session",
+                "updated_at": None,
+                "active_session_count": active_session_count,
+            }
+
+        current["active_session_count"] = active_session_count
+        if active_session_count == 0:
+            current["state"] = "offline"
+            current["detail"] = current.get("detail") or "No active web session"
+        elif current.get("state") == "offline":
+            current["state"] = "waiting"
+            current["detail"] = "Connected, waiting for input"
+        return current
+
 
 manager = ConnectionManager()
+
+
+async def _sync_native_agent_status(agent_id: uuid.UUID, status: str) -> None:
+    """Keep persisted native-agent status aligned with real web runtime."""
+    async with async_session() as db:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+        if not agent or (agent.agent_type or "native") != "native":
+            return
+        agent.status = status
+        agent.last_active_at = datetime.now(timezone.utc)
+        await db.commit()
 
 
 from fastapi import Depends
@@ -279,6 +328,8 @@ async def websocket_chat(
     if agent_id_str not in manager.active_connections:
         manager.active_connections[agent_id_str] = []
     manager.active_connections[agent_id_str].append((websocket, conv_id))
+    manager.mark_state(agent_id_str, "waiting", "Connected, waiting for input", session_id=conv_id)
+    await _sync_native_agent_status(agent_id, "running")
     logger.info(f"[WS] Ready! Agent={agent_name}")
 
     # Send session_id to frontend so Take Control can reference the correct session.
@@ -332,6 +383,7 @@ async def websocket_chat(
 
         while True:
             logger.info(f"[WS] Waiting for message from {agent_name}...")
+            manager.mark_state(agent_id_str, "waiting", "Connected, waiting for input", session_id=conv_id)
             data = await websocket.receive_json()
 
             # Set a unique trace ID for this specific message processing.
@@ -347,6 +399,8 @@ async def websocket_chat(
 
             if not content:
                 continue
+
+            manager.mark_state(agent_id_str, "thinking", "Received request, preparing response", session_id=conv_id)
 
             # ── Quota checks ──
             try:
@@ -449,11 +503,18 @@ async def websocket_chat(
                     
                     async def stream_to_ws(text: str):
                         """Send each chunk to client in real-time."""
+                        manager.mark_state(agent_id_str, "responding", "Generating visible response", session_id=conv_id)
                         partial_chunks.append(text)
                         await websocket.send_json({"type": "chunk", "content": text})
                     
                     async def tool_call_to_ws(data: dict):
                         """Send tool call info to client and persist completed ones."""
+                        if data.get("status") == "running":
+                            tool_name = data.get("name", "tool")
+                            manager.mark_state(agent_id_str, "tool_running", f"Running tool: {tool_name}", session_id=conv_id)
+                        elif data.get("status") == "done":
+                            tool_name = data.get("name", "tool")
+                            manager.mark_state(agent_id_str, "thinking", f"Tool finished: {tool_name}", session_id=conv_id)
                         if data.get("status") == "done":
                             try:
                                 from app.services.agentbay_live import detect_agentbay_env, get_desktop_screenshot, get_browser_snapshot
@@ -505,6 +566,7 @@ async def websocket_chat(
                     
                     async def thinking_to_ws(text: str):
                         """Send thinking chunks to client for collapsible display."""
+                        manager.mark_state(agent_id_str, "thinking", "Analyzing request", session_id=conv_id)
                         thinking_content.append(text)
                         await websocket.send_json({"type": "thinking", "content": text})
 
@@ -652,6 +714,7 @@ async def websocket_chat(
 
             # Final 'done' packet
             await websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
+            manager.mark_state(agent_id_str, "waiting", "Finished, waiting for next input", session_id=conv_id)
 
             # Re-process any queued messages (if user sent something during generation)
             for qm in queued_messages:
@@ -661,8 +724,12 @@ async def websocket_chat(
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {user_id}")
         manager.disconnect(str(agent_id), websocket)
+        if not manager.active_connections.get(str(agent_id)):
+            await _sync_native_agent_status(agent_id, "idle")
     except Exception as e:
         logger.error(f"[WS] Unexpected error: {e}")
         import traceback
         traceback.print_exc()
         manager.disconnect(str(agent_id), websocket)
+        if not manager.active_connections.get(str(agent_id)):
+            await _sync_native_agent_status(agent_id, "idle")

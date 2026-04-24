@@ -68,8 +68,9 @@ const fetchJson = async <T,>(url: string): Promise<T> => {
 
 /* Compute display badge status for an agent */
 const getAgentBadgeStatus = (agent: any): string | null => {
-    if (agent.status === 'error') return 'error';
+    if (agent.runtime_state && agent.runtime_state !== 'offline') return null;
     if (agent.status === 'creating') return 'creating';
+    if (agent.status === 'error') return 'error';
     // OpenClaw disconnected detection: 60 min timeout
     if (agent.agent_type === 'openclaw' && agent.status === 'running' && agent.openclaw_last_seen) {
         const elapsed = Date.now() - new Date(agent.openclaw_last_seen).getTime();

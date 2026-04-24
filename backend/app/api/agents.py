@@ -25,6 +25,60 @@ def _serialize_dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _runtime_snapshot(agent: Agent) -> dict:
+    """Build a UI-friendly runtime snapshot without relying on state.json."""
+    if (agent.agent_type or "native") == "openclaw":
+        now = datetime.now(timezone.utc)
+        online = bool(agent.openclaw_last_seen and (now - agent.openclaw_last_seen).total_seconds() < 300)
+        return {
+            "is_online": online,
+            "runtime_state": "waiting" if online else "offline",
+            "runtime_detail": "Connected via gateway heartbeat" if online else "No recent gateway heartbeat",
+            "runtime_updated_at": agent.openclaw_last_seen,
+            "active_session_count": 0,
+        }
+
+    try:
+        from app.api.websocket import manager as ws_manager
+        runtime = ws_manager.get_runtime(str(agent.id))
+    except Exception:
+        runtime = {
+            "state": "offline",
+            "detail": "Runtime unavailable",
+            "updated_at": None,
+            "active_session_count": 0,
+        }
+
+    runtime_state = runtime.get("state") or "offline"
+    is_online = runtime_state != "offline"
+    runtime_detail = runtime.get("detail")
+    runtime_updated_at = runtime.get("updated_at") or agent.last_active_at
+    active_session_count = runtime.get("active_session_count", 0)
+
+    return {
+        "is_online": is_online,
+        "runtime_state": runtime_state,
+        "runtime_detail": runtime_detail,
+        "runtime_updated_at": runtime_updated_at,
+        "active_session_count": active_session_count,
+    }
+
+
+def _serialize_agent_out(agent: Agent, access_level: str | None = None) -> dict:
+    """Serialize agent with dynamic runtime fields for the UI."""
+    out = AgentOut.model_validate(agent).model_dump()
+    runtime = _runtime_snapshot(agent)
+    out.update(runtime)
+
+    if out.get("status") in {"running", "idle"}:
+        out["status"] = "running" if runtime["is_online"] else "idle"
+
+    if access_level is not None:
+        out["access_level"] = access_level
+
+    return out
+
+
 async def _archive_agent_task_history(db: AsyncSession, agent_id: uuid.UUID, archive_dir: Path) -> Path | None:
     """Persist task and task-log history into the agent archive directory before DB cleanup."""
     from app.models.task import Task, TaskLog
@@ -139,8 +193,7 @@ async def list_agents(
     db: AsyncSession = Depends(get_db),
 ):
     """List all agents the current user has access to."""
-    # platform_admin & org_admin see all agents (optionally filtered by tenant)
-    if current_user.role in ("platform_admin", "org_admin"):
+    if current_user.role == "platform_admin":
         stmt = select(Agent)
         if tenant_id:
             stmt = stmt.where(Agent.tenant_id == tenant_id)
@@ -153,7 +206,24 @@ async def list_agents(
                 needs_flush = True
         if needs_flush:
             await db.commit()
-        return [AgentOut.model_validate(a) for a in agents]
+        return [_serialize_agent_out(a) for a in agents]
+
+    if current_user.role == "org_admin":
+        if tenant_id and tenant_id != current_user.tenant_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot access other tenant's agents")
+        stmt = select(Agent)
+        if current_user.tenant_id:
+            stmt = stmt.where(Agent.tenant_id == current_user.tenant_id)
+        result = await db.execute(stmt.order_by(Agent.created_at.desc()))
+        agents = result.scalars().all()
+        # Lazy reset token counters
+        needs_flush = False
+        for a in agents:
+            if await _lazy_reset_token_counters(a, db):
+                needs_flush = True
+        if needs_flush:
+            await db.commit()
+        return [_serialize_agent_out(a) for a in agents]
 
     # agent_admin sees their own created agents + permitted
     # member sees only permitted
@@ -188,7 +258,7 @@ async def list_agents(
             needs_flush = True
     if needs_flush:
         await db.commit()
-    return [AgentOut.model_validate(a) for a in agents]
+    return [_serialize_agent_out(a) for a in agents]
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -209,9 +279,15 @@ async def create_agent(
     from datetime import datetime, timedelta, timezone as tz
     expires_at = datetime.now(tz.utc) + timedelta(hours=current_user.quota_agent_ttl_hours or 48)
 
-    # Determine target tenant: normally user's tenant; admins can override via payload
+    # Determine target tenant: normally user's tenant; only platform admins can
+    # override via payload to create agents for another tenant.
     target_tenant_id = current_user.tenant_id
-    if current_user.role in ("platform_admin", "org_admin") and data.tenant_id:
+    if data.tenant_id:
+        if current_user.role != "platform_admin" and data.tenant_id != current_user.tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot create agents for another tenant",
+            )
         target_tenant_id = data.tenant_id
 
     # Get default limits from target tenant
@@ -336,8 +412,11 @@ async def create_agent(
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_text(sf.content, encoding="utf-8")
 
-    # Start container
-    await agent_manager.start_container(db, agent)
+    # Only OpenClaw agents are backed by managed containers.
+    if agent.agent_type == "openclaw":
+        await agent_manager.start_container(db, agent)
+    else:
+        agent.status = "idle"
     await db.flush()
 
     return AgentOut.model_validate(agent)
@@ -354,8 +433,7 @@ async def get_agent(
     # Lazy reset token counters
     if await _lazy_reset_token_counters(agent, db):
         await db.commit()
-    out = AgentOut.model_validate(agent).model_dump()
-    out["access_level"] = access_level
+    out = _serialize_agent_out(agent, access_level=access_level)
 
     # Resolve creator username (one extra query, only on detail page).
     # IMPORTANT: User.username is an association_proxy to User.identity.username.
@@ -668,6 +746,11 @@ async def start_agent(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only creator can start agent")
+    if (agent.agent_type or "native") != "openclaw":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Native agents do not use managed containers",
+        )
 
     from app.services.agent_manager import agent_manager
     await agent_manager.start_container(db, agent)
@@ -685,6 +768,11 @@ async def stop_agent(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only creator can stop agent")
+    if (agent.agent_type or "native") != "openclaw":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Native agents do not use managed containers",
+        )
 
     from app.services.agent_manager import agent_manager
     await agent_manager.stop_container(agent)

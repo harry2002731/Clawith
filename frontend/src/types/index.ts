@@ -40,6 +40,11 @@ export interface Agent {
     openclaw_last_seen?: string;
     created_at: string;
     last_active_at?: string;
+    is_online?: boolean;
+    runtime_state?: 'offline' | 'waiting' | 'thinking' | 'responding' | 'tool_running' | string;
+    runtime_detail?: string;
+    runtime_updated_at?: string;
+    active_session_count?: number;
 }
 
 export interface Task {

@@ -35,6 +35,23 @@ router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 settings = get_settings()
 
 
+def _resolve_enterprise_info_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID:
+    """Resolve the tenant scope for enterprise info APIs."""
+    if tenant_id:
+        try:
+            requested = uuid.UUID(tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid tenant_id format") from exc
+        if current_user.role != "platform_admin" and requested != current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="Cannot access other tenant's enterprise info")
+        return requested
+
+    if current_user.tenant_id:
+        return current_user.tenant_id
+
+    raise HTTPException(status_code=403, detail="Tenant context required")
+
+
 # ─── Public: Check Email Exists ────────────────────────
 
 class CheckEmailRequest(BaseModel):
@@ -76,15 +93,12 @@ class LLMTestRequest(BaseModel):
     model_id: str | None = None  # existing model ID to use stored API key
 
 
-async def _load_llm_test_api_key(model_id: str | None) -> str | None:
-    """Load the stored API key for llm-test using a short-lived independent session."""
-    if not model_id:
-        return None
-
-    async with async_session() as session:
-        result = await session.execute(select(LLMModel).where(LLMModel.id == model_id))
-        existing = result.scalar_one_or_none()
-        return get_model_api_key(existing) if existing else None
+def _ensure_llm_model_access(current_user: User, model: LLMModel) -> None:
+    """Enforce tenant-scoped access for non-platform admins."""
+    if current_user.role == "platform_admin":
+        return
+    if model.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other tenant's models")
 
 
 @router.post("/llm-test")
@@ -98,7 +112,13 @@ async def test_llm_model(
     # Resolve API key: use provided key, or look up from stored model
     api_key = data.api_key if data.api_key and not data.api_key.startswith('****') else None
     if not api_key and data.model_id:
-        api_key = await _load_llm_test_api_key(data.model_id)
+        async with async_session() as session:
+            result = await session.execute(select(LLMModel).where(LLMModel.id == data.model_id))
+            existing = result.scalar_one_or_none()
+            if not existing:
+                return {"success": False, "latency_ms": 0, "error": "Model not found"}
+            _ensure_llm_model_access(current_user, existing)
+            api_key = get_model_api_key(existing)
     if not api_key:
         return {"success": False, "latency_ms": 0, "error": "API Key is required"}
 
@@ -159,6 +179,8 @@ async def add_llm_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Add a new LLM model to the tenant's pool (admin)."""
+    if tenant_id and current_user.role != "platform_admin" and str(current_user.tenant_id) != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot create models for another tenant")
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     model = LLMModel(
         provider=data.provider,
@@ -191,6 +213,7 @@ async def remove_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _ensure_llm_model_access(current_user, model)
 
     # Check if any agents reference this model
     from sqlalchemy import or_
@@ -234,6 +257,7 @@ async def update_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _ensure_llm_model_access(current_user, model)
 
     try:
         if data.provider:
@@ -271,11 +295,17 @@ async def update_llm_model(
 
 @router.get("/info", response_model=list[EnterpriseInfoOut])
 async def list_enterprise_info(
+    tenant_id: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List all enterprise information entries."""
-    result = await db.execute(select(EnterpriseInfo).order_by(EnterpriseInfo.info_type))
+    effective_tenant_id = _resolve_enterprise_info_tenant_id(current_user, tenant_id)
+    result = await db.execute(
+        select(EnterpriseInfo)
+        .where(EnterpriseInfo.tenant_id == effective_tenant_id)
+        .order_by(EnterpriseInfo.info_type)
+    )
     return [EnterpriseInfoOut.model_validate(e) for e in result.scalars().all()]
 
 
@@ -283,15 +313,17 @@ async def list_enterprise_info(
 async def update_enterprise_info(
     info_type: str,
     data: EnterpriseInfoUpdate,
+    tenant_id: str | None = None,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update enterprise information. Triggers sync to agents."""
+    effective_tenant_id = _resolve_enterprise_info_tenant_id(current_user, tenant_id)
     info = await enterprise_sync_service.update_enterprise_info(
-        db, info_type, data.content, data.visible_roles, current_user.id
+        db, effective_tenant_id, info_type, data.content, data.visible_roles, current_user.id
     )
-    # Sync to all running agents
-    await enterprise_sync_service.sync_to_all_agents(db)
+    # Sync to running agents in the same tenant only
+    await enterprise_sync_service.sync_to_all_agents(db, effective_tenant_id)
     return EnterpriseInfoOut.model_validate(info)
 
 

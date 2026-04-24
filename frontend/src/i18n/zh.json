@@ -168,6 +168,7 @@
       "active": "活跃"
     },
     "status": {
+      "available": "可用",
       "running": "运行中",
       "idle": "待命中",
       "stopped": "已停止",
@@ -188,6 +189,7 @@
   },
   "agent": {
     "status": {
+      "available": "可用",
       "running": "正在工作",
       "idle": "待命中",
       "stopped": "已停止",
