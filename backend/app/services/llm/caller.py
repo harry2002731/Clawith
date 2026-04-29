@@ -322,6 +322,7 @@ async def call_llm(
             content=msg.get("content"),
             tool_calls=msg.get("tool_calls"),
             tool_call_id=msg.get("tool_call_id"),
+            reasoning_content=msg.get("reasoning_content"),
         ))
 
     # Vision format conversion

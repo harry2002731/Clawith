@@ -69,15 +69,50 @@ class ConnectionManager:
             return []
         return list(set(sid for _ws, sid in self.active_connections[agent_id] if sid))
 
-    def mark_state(self, agent_id: str, state: str, detail: str | None = None, session_id: str | None = None):
+    def mark_state(
+        self,
+        agent_id: str,
+        state: str,
+        detail: str | None = None,
+        session_id: str | None = None,
+        source: str = "web",
+    ):
         """Track the current runtime state for an agent."""
         self.runtime_state[agent_id] = {
             "state": state,
             "detail": detail,
             "session_id": session_id,
+            "source": source,
             "updated_at": datetime.now(timezone.utc),
             "active_session_count": len(self.active_connections.get(agent_id, [])),
         }
+
+    def clear_state(
+        self,
+        agent_id: str,
+        *,
+        source: str | None = None,
+        session_id: str | None = None,
+        offline_detail: str | None = None,
+    ):
+        """Clear a runtime state only if it matches the expected source/session."""
+        current = self.runtime_state.get(agent_id)
+        if current:
+            if source is not None and current.get("source") != source:
+                return
+            if session_id is not None and current.get("session_id") != session_id:
+                return
+
+        if len(self.active_connections.get(agent_id, [])) > 0:
+            self.mark_state(agent_id, "waiting", "Connected, waiting for input", source="web")
+        else:
+            self.mark_state(
+                agent_id,
+                "offline",
+                offline_detail or "No active session",
+                session_id=session_id,
+                source=source or (current.get("source") if current else "web"),
+            )
 
     def get_runtime(self, agent_id: str) -> dict:
         """Return a runtime snapshot for UI consumption."""
@@ -93,9 +128,11 @@ class ConnectionManager:
             }
 
         current["active_session_count"] = active_session_count
+        state_source = current.get("source", "web")
         if active_session_count == 0:
-            current["state"] = "offline"
-            current["detail"] = current.get("detail") or "No active web session"
+            if state_source != "background" or current.get("state") == "offline":
+                current["state"] = "offline"
+                current["detail"] = current.get("detail") or "No active web session"
         elif current.get("state") == "offline":
             current["state"] = "waiting"
             current["detail"] = "Connected, waiting for input"
@@ -115,6 +152,34 @@ async def _sync_native_agent_status(agent_id: uuid.UUID, status: str) -> None:
         agent.status = status
         agent.last_active_at = datetime.now(timezone.utc)
         await db.commit()
+
+
+async def set_agent_runtime(
+    agent_id: uuid.UUID | str,
+    state: str,
+    detail: str | None = None,
+    *,
+    session_id: str | None = None,
+    source: str = "background",
+) -> None:
+    """Expose runtime tracking to non-WebSocket execution paths."""
+    manager.mark_state(str(agent_id), state, detail, session_id=session_id, source=source)
+
+
+async def clear_agent_runtime(
+    agent_id: uuid.UUID | str,
+    *,
+    source: str = "background",
+    session_id: str | None = None,
+    offline_detail: str | None = None,
+) -> None:
+    """Clear runtime tracking for non-WebSocket execution paths."""
+    manager.clear_state(
+        str(agent_id),
+        source=source,
+        session_id=session_id,
+        offline_detail=offline_detail,
+    )
 
 
 from fastapi import Depends

@@ -1654,15 +1654,29 @@ function AgentDetailInner() {
         }
     };
 
-    const selectSession = async (rawSess: any, scopeOverride: 'mine' | 'all' = chatScope) => {
+    // 滚动位置保存
+    const scrollPositionRef = useRef<Map<string, number>>(new Map());
+    const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+
+    const selectSession = async (rawSess: any, scopeOverride: 'mine' | 'all' = chatScope, forceReload: boolean = false) => {
         const sess = normalizeChatSession(rawSess);
         const targetAgentId = id;
         if (!targetAgentId) return;
         const runtimeKey = buildSessionRuntimeKey(targetAgentId, String(sess.id));
         const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false };
+        
+        // 保存当前滚动位置（如果是同一会话的重新加载）
+        const isSameSession = activeSessionIdRef.current === sess.id;
+        const currentScrollPos = isSameSession ? (chatContainerRef.current?.scrollTop || 0) : 0;
+        
         activeSessionIdRef.current = sess.id;
-        setChatMessages([]);
-        setHistoryMsgs([]);
+        
+        // 只在强制重新加载或切换到不同会话时才清空消息
+        if (forceReload || !isSameSession) {
+            setChatMessages([]);
+            setHistoryMsgs([]);
+        }
+        
         setIsStreaming(runtimeState.isStreaming);
         setIsWaiting(runtimeState.isWaiting);
         setActiveSession(sess);
@@ -1674,6 +1688,9 @@ function AgentDetailInner() {
         const controller = new AbortController();
         sessionMsgAbortRef.current = controller;
         const loadSeq = ++sessionLoadSeqRef.current;
+        
+        setIsLoadingMessages(true);
+        
         try {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages`, {
@@ -1698,9 +1715,21 @@ function AgentDetailInner() {
             } else {
                 setHistoryMsgs(preParsed);
             }
+            
+            // 恢复滚动位置
+            if (isSameSession && currentScrollPos > 0) {
+                requestAnimationFrame(() => {
+                    const container = chatContainerRef.current;
+                    if (container) {
+                        container.scrollTop = currentScrollPos;
+                    }
+                });
+            }
         } catch (err: any) {
             if (err?.name === 'AbortError') return;
             console.error('Failed to load session messages:', err);
+        } finally {
+            setIsLoadingMessages(false);
         }
     };
 
@@ -1970,13 +1999,15 @@ function AgentDetailInner() {
         let cancelled = false;
         const run = async () => {
             if (document.visibilityState !== 'visible') return;
+            
+            // 只刷新会话列表，不重复加载消息
             await fetchMySessions(true, id);
             if (canViewAllAgentChatSessions && chatScope === 'all') {
                 await fetchAllSessions();
             }
-            if (!cancelled && activeSession && !isWritableSession(activeSession, chatScope)) {
-                await selectSession(activeSession, chatScope);
-            }
+            
+            // 不再每 8 秒重新加载消息，避免清空和滚动跳转
+            // WebSocket 实时推送会更新消息，无需轮询
         };
 
         const timer = window.setInterval(run, 8000);
@@ -4667,6 +4698,13 @@ function AgentDetailInner() {
                                                 });
                                             })()
                                             }
+                                            {isLoadingMessages && (
+                                                <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', animation: 'fadeIn .2s ease' }}>
+                                                    <div style={{ padding: '8px 12px', borderRadius: '12px', background: 'var(--bg-tertiary)', fontSize: '13px', color: 'var(--text-secondary)' }}>
+                                                        正在加载对话记录...
+                                                    </div>
+                                                </div>
+                                            )}
                                             {isWaiting && (
                                                 <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', animation: 'fadeIn .2s ease' }}>
                                                     <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: 'var(--bg-elevated)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, color: 'var(--text-secondary)', fontWeight: 600 }}>A</div>

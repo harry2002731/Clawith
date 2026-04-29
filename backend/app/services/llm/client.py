@@ -267,11 +267,20 @@ class OpenAICompatibleClient(LLMClient):
             self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=None)
         return self._client
 
+    def _is_kimi_code(self) -> bool:
+        """Detect Kimi Code API by base URL or model name."""
+        url = (self.base_url or "").lower()
+        model = (self.model or "").lower()
+        return "api.kimi.com" in url or model == "kimi-for-coding"
+
     def _get_headers(self) -> dict[str, str]:
-        return {
+        headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+        if self._is_kimi_code():
+            headers["User-Agent"] = "KimiCLI/1.6"
+        return headers
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL by stripping trailing /chat/completions."""
@@ -477,6 +486,7 @@ class OpenAICompatibleClient(LLMClient):
         return LLMResponse(
             content=msg.get("content", ""),
             tool_calls=msg.get("tool_calls", []),
+            reasoning_content=msg.get("reasoning_content"),
             finish_reason=choice.get("finish_reason"),
             usage=data.get("usage"),
             model=data.get("model"),
@@ -1815,6 +1825,13 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         display_name="Kimi (Moonshot)",
         protocol="openai_compatible",
         default_base_url="https://api.moonshot.cn/v1",
+        default_max_tokens=8192,
+    ),
+    "kimi-code": ProviderSpec(
+        provider="kimi-code",
+        display_name="Kimi Code",
+        protocol="openai_compatible",
+        default_base_url="https://api.kimi.com/coding/v1",
         default_max_tokens=8192,
     ),
     "vllm": ProviderSpec(

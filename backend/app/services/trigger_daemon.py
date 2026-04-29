@@ -393,7 +393,13 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     from app.models.chat_session import ChatSession
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
+    from app.api.websocket import set_agent_runtime, clear_agent_runtime
 
+    background_runtime = any(
+        t.name == "a2a_wake" or t.name.startswith("a2a_wait_") or (t.config or {}).get("_a2a_session_id")
+        for t in triggers
+    )
+    runtime_session_id: str | None = None
     try:
         async with async_session() as db:
             # Load agent
@@ -478,15 +484,60 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             await db.commit()
             # Cache participant ID for callbacks
             agent_participant_id = agent_participant.id if agent_participant else None
+            runtime_session_id = str(session_id)
+
+        if background_runtime:
+            await set_agent_runtime(
+                agent_id,
+                "thinking",
+                "Processing agent-to-agent work",
+                session_id=runtime_session_id,
+                source="background",
+            )
 
         # Call LLM (outside the DB session to avoid long transactions)
         collected_content = []
 
         async def on_chunk(text):
             collected_content.append(text)
+            if background_runtime and text and text.strip():
+                await set_agent_runtime(
+                    agent_id,
+                    "responding",
+                    "Generating reply",
+                    session_id=runtime_session_id,
+                    source="background",
+                )
+
+        async def on_thinking(_text):
+            if background_runtime:
+                await set_agent_runtime(
+                    agent_id,
+                    "thinking",
+                    "Analyzing request",
+                    session_id=runtime_session_id,
+                    source="background",
+                )
 
         # Persist tool calls into Reflection Session for Reflections visibility
         async def on_tool_call(data):
+            if background_runtime:
+                if data["status"] == "running":
+                    await set_agent_runtime(
+                        agent_id,
+                        "tool_running",
+                        f"Running tool: {data['name']}",
+                        session_id=runtime_session_id,
+                        source="background",
+                    )
+                elif data["status"] == "done":
+                    await set_agent_runtime(
+                        agent_id,
+                        "thinking",
+                        f"Tool finished: {data['name']}",
+                        session_id=runtime_session_id,
+                        source="background",
+                    )
             try:
                 async with async_session() as _tc_db:
                     if data["status"] == "running":
@@ -521,6 +572,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             user_id=agent.creator_id,
             session_id=str(session_id),
             on_chunk=on_chunk,
+            on_thinking=on_thinking,
             on_tool_call=on_tool_call,
             # A2A wake uses the agent's own max_tool_rounds setting (no override)
         )
@@ -705,6 +757,14 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        if background_runtime:
+            await clear_agent_runtime(
+                agent_id,
+                source="background",
+                session_id=runtime_session_id,
+                offline_detail="No active background task",
+            )
 
 
 # ── Main Tick Loop ──────────────────────────────────────────────────

@@ -5100,6 +5100,8 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 LLMMessage(role=m["role"], content=m["content"]) for m in conversation_messages
             ]
 
+            from app.api.websocket import set_agent_runtime, clear_agent_runtime
+
             # Load tools for target agent
             tools_for_llm = await get_agent_tools_for_llm(target.id)
 
@@ -5132,6 +5134,13 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 return False
 
             try:
+                await set_agent_runtime(
+                    target.id,
+                    "thinking",
+                    "Processing agent-to-agent request",
+                    session_id=session_id,
+                    source="background",
+                )
                 for _round in range(max_tool_rounds):
                     response = None
                     for attempt in range(1, _A2A_MAX_RETRIES + 1):
@@ -5159,6 +5168,15 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
                     if response is None:
                         raise RuntimeError("A2A LLM response is unexpectedly empty after retries")
+
+                    if response.reasoning_content:
+                        await set_agent_runtime(
+                            target.id,
+                            "thinking",
+                            "Analyzing request",
+                            session_id=session_id,
+                            source="background",
+                        )
 
                     # Track tokens from API response
                     real_tokens = extract_usage_tokens(response.usage)
@@ -5195,7 +5213,21 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                                 except Exception:
                                     tool_args = {}
 
+                            await set_agent_runtime(
+                                target.id,
+                                "tool_running",
+                                f"Running tool: {tool_name}",
+                                session_id=session_id,
+                                source="background",
+                            )
                             tool_result = await execute_tool(tool_name, tool_args, target.id, owner_id)
+                            await set_agent_runtime(
+                                target.id,
+                                "thinking",
+                                f"Tool finished: {tool_name}",
+                                session_id=session_id,
+                                source="background",
+                            )
 
                             # Nudge: after write_file in A2A, remind to deliver via send_file_to_agent
                             if tool_name == "write_file" and isinstance(tool_result, str) and tool_result.startswith("\u2705"):
@@ -5235,10 +5267,23 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                         continue  # Next LLM round
 
                     # No tool calls — this is the final text response
+                    await set_agent_runtime(
+                        target.id,
+                        "responding",
+                        "Generating reply",
+                        session_id=session_id,
+                        source="background",
+                    )
                     target_reply = response.content or ""
                     break
             finally:
                 await llm_client.close()
+                await clear_agent_runtime(
+                    target.id,
+                    source="background",
+                    session_id=session_id,
+                    offline_detail="No active background task",
+                )
 
             # Record accumulated A2A tokens for the target agent
             if _a2a_accumulated_tokens > 0:
